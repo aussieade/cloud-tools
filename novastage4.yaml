@@ -1,0 +1,71 @@
+# do nova stage 4 upgrades
+#
+# req. hiera updated in an env or prod
+# must pass `-e group=<group> -e env=<environment>` at minimum
+---
+- name: nova stage 4 upgrade
+  hosts: '{{ group }}'
+  gather_facts: no
+
+  vars:
+    ENV: "{{ env|default('') }}"
+    SRV: "{{ server|default('') }}"
+    REAL: "{{ real|default('0') }}"
+    UNLOCK: "{{ unlock|default('0') }}"
+
+  tasks:
+    - name: puppet agent lock
+      shell: /opt/puppetlabs/bin/puppet agent --disable 'nova stage 4 upgrade'
+      args:
+        creates: /opt/puppetlabs/puppet/cache/state/agent_disabled.lock
+      when: REAL == '1'
+
+    - name: pre apt update
+      apt:
+        update_cache: yes
+        cache_valid_time: 600
+
+    - name: pre apt dist upgrade
+      apt:
+        dpkg_options: 'force-confold,force-confdef'
+        upgrade: dist
+      when: REAL == '1'
+
+    - name: wait for any running agents
+      wait_for:
+        path: /opt/puppetlabs/puppet/cache/state/agent_catalog_run.lock
+        state: absent
+      when: ENV != ''
+
+    - name: puppet agent run
+      shell: /opt/puppetlabs/bin/puppet agent --test {{ '' if (SRV == '') else
+             '--no-use_srv_records --server ' + SRV }}
+             --environment {{ ENV|quote }}
+             {{ '' if REAL == '1' else '--noop' }}
+             --agent_disabled_lockfile=/none
+             --verbose --color=false
+      register: puppet_agent_result
+      changed_when: puppet_agent_result.rc == 2
+      failed_when: puppet_agent_result.rc != 2 and puppet_agent_result.rc != 0
+      when: ENV != ''
+      ignore_errors: no
+
+    - name: agent output
+      debug: var=puppet_agent_result.stdout_lines
+      when: ENV != '' and (puppet_agent_result.rc != 0 or REAL == '0')
+
+    # no real need to update cache here puppet should have done it
+    - name: post dist upgrade
+      apt:
+        update_cache: yes
+        cache_valid_time: 600
+        autoremove: yes
+        dpkg_options: 'force-confold,force-confdef'
+        upgrade: dist
+      when: REAL == '1'
+
+    - name: agent unlock
+      shell: /opt/puppetlabs/bin/puppet agent --enable
+      args:
+        removes: /opt/puppetlabs/puppet/cache/state/agent_disabled.lock
+      when: REAL == '1' and UNLOCK == '1'
