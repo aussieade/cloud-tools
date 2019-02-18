@@ -1,0 +1,3 @@
+#!/bin/bash
+
+virtguests $1 | grep ^cpu | awk '{c=0;m=0;do {c=c+$5;m=m+$7} while(getline);printf("cpu: %d\tmem: %dgb\n",c,m/1024)}'
