@@ -1,0 +1,243 @@
+#!/usr/bin/env python
+#
+# Filename: roletool
+# Author: Ade <aussieade@gmail.com>
+# Description:
+"""Adds/removes specified roles for user/s in a project
+   will use env. creds if cloud name not specified.
+"""
+
+# Change Log:
+# 0.0.1 initial try-not-to-shoot-yourself-in-the-foot version
+
+from __future__ import print_function
+
+import sys
+import argparse
+import os_client_config
+from os_client_config.exceptions import OpenStackConfigException
+from keystoneclient.exceptions import NotFound
+from keystoneauth1.exceptions.auth_plugins import MissingRequiredOptions
+from prettytable import PrettyTable
+
+help_desc = """list or modify project user/s role assignment (default ALL users)
+multiple users or roles can be specified by repeating arguments.
+"""
+help_example = """e.g to add tester and betatester roles to users
+    test1 and test2 in project test_tenant use:
+
+roletool -u test1 -u test2 -a tester -a betatester test_tenant
+"""
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 description=help_desc, epilog=help_example)
+parser.add_argument('project', help='project name or uuid')
+parser.add_argument('-n', '--noop', action='store_true', help='dry run (noop) mode')
+parser.add_argument('-c', '--cloud', help='os-client-config cloud name (optional)')
+parser.add_argument('-u', '--user', action='append',
+                    help='user name or uuid to action (optional)')
+group = parser.add_argument_group('action arguments')
+excl = group.add_mutually_exclusive_group()
+excl.add_argument('-a', '--add', type=str, action='append',
+                  help='role to add to user/s in project')
+excl.add_argument('-d', '--delete', type=str, action='append',
+                  help='role to delete from user/s in project')
+
+args = parser.parse_args()
+
+
+def get_keystone(cloud):
+    """get keystone client
+
+    :params cloud: os_client_config cloud name (optional)
+    :return: keystone client connection
+    """
+    if cloud:
+        try:
+            k = os_client_config.make_client('identity', cloud=cloud)
+        except OpenStackConfigException:
+            print('cloud config for %s not found' % cloud)
+            sys.exit(1)
+    else:
+        try:
+            k = os_client_config.make_client('identity')
+        except (OpenStackConfigException, MissingRequiredOptions):
+            print('keystone authentication failed')
+            sys.exit(1)
+    return k
+
+
+def get_project(keystone, project):
+    """get project from name or id
+
+    :params keystone: keystone client connection
+    :params project: keystone project name or id
+    :returns: keystone project object
+    """
+    try:
+        p = keystone.projects.get(project)
+    except NotFound:
+        try:
+            p = keystone.projects.find(name=project)
+        except NotFound:
+            print('project "%s" not found' % project)
+            sys.exit(1)
+    return p
+
+
+def get_project_users(keystone, project):
+    """get list of users in a project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :returns: list of user_ids
+    """
+    role_assigns = keystone.role_assignments.list(project=project.id,
+                                                  include_names=True)
+    users = []
+    for ra in role_assigns:
+        if ra.user['id'] not in users:
+            users.append(ra.user['id'])
+    return users
+
+
+def get_userid(keystone, project, user):
+    """get userid for specific username (or userid)
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :param user: username or userid
+    :returns: user uuid
+    """
+    role_assigns = keystone.role_assignments.list(project=project.id,
+                                                  include_names=True)
+    for ra in role_assigns:
+        if user in (ra.user['id'], ra.user['name']):
+            return ra.user['id']
+    print('no user id found for %s' % user)
+    sys.exit(1)
+
+
+def print_roles(keystone, project):
+    """print details of users in a project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    """
+    table = PrettyTable(['id', 'name', 'roles'])
+    role_assigns = keystone.role_assignments.list(project=project.id,
+                                                  include_names=True)
+    users = {}
+    for ra in role_assigns:
+        if ra.user['id'] in users:
+            users[ra.user['id']]['roles'].append(ra.role['name'])
+        else:
+            users[ra.user['id']] = {}
+            users[ra.user['id']]['name'] = ra.user['name']
+            users[ra.user['id']]['roles'] = [ra.role['name']]
+    for user_id, attrs in users.items():
+        if args.user:
+            if user_id in args.user or attrs['name'] in args.user:
+                table.add_row([user_id, attrs['name'], ', '.join(attrs['roles'])])
+        else:
+            table.add_row([user_id, attrs['name'], ', '.join(attrs['roles'])])
+    print(str(table))
+
+
+def add_project_roles(keystone, project, roles):
+    """add required roles to all users in project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :param roles: array of role/s to add
+    """
+    for userid in get_project_users(keystone, project):
+        for role in roles:
+            role = keystone.roles.find(name=role)
+            keystone.roles.grant(user=userid, project=project.id, role=role.id)
+
+
+def add_user_roles(keystone, project, roles, userid):
+    """add required roles to a single user in project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :param roles: array of role/s to add
+    :param userid: user.id of single user
+    """
+    for role in roles:
+        role = keystone.roles.find(name=role)
+        keystone.roles.grant(user=userid, project=project.id, role=role.id)
+
+
+def del_project_roles(keystone, project, roles):
+    """add required roles to all users in project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :param roles: array of role/s to add
+    """
+    for userid in get_project_users(keystone, project):
+        for role in roles:
+            role = keystone.roles.find(name=role)
+            try:
+                keystone.roles.revoke(user=userid, project=project.id, role=role.id)
+            except NotFound:
+                pass
+
+
+def del_user_roles(keystone, project, roles, userid):
+    """delete required roles from a single user in project
+
+    :param keystone: keystone client connection
+    :param project: keystone project object
+    :param roles: array of role/s to add
+    :param userid: user.id of single user
+    """
+    for role in roles:
+        role = keystone.roles.find(name=role)
+        try:
+            keystone.roles.revoke(user=userid, project=project.id, role=role.id)
+        except NotFound:
+            pass
+
+
+def main():
+    """ main function """
+    k = get_keystone(args.cloud)
+    p = get_project(k, args.project)
+
+    if args.add:
+        if args.user:
+            for u in args.user:
+                if args.noop:
+                    print('would add role %s to user %s' %
+                          (args.add, get_userid(k, p, u)))
+                else:
+                    add_user_roles(k, p, args.add, get_userid(k, p, u))
+        else:
+            if args.noop:
+                print('would add role %s to project %s' % (args.add, args.project))
+            else:
+                add_project_roles(k, p, args.add)
+    elif args.delete:
+        if args.user:
+            for u in args.user:
+                if args.noop:
+                    print('would delete role %s from user %s' %
+                          (args.delete, get_userid(k, p, u)))
+                else:
+                    del_user_roles(k, p, args.delete, get_userid(k, p, u))
+        else:
+            if args.noop:
+                print('would delete role %s from all users in project %s'
+                      % (args.delete, args.project))
+            else:
+                del_project_roles(k, p, args.delete)
+    if not args.noop:
+        print_roles(k, p)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
